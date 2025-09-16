@@ -1,225 +1,321 @@
 #!/usr/bin/env python3
-# DBNet-like text detector prototype (Step 1)
-# See README in header comments of the notebook cell that generated this.
-import os, json, math, random
-from typing import List, Tuple, Dict, Any
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+# -*- coding: utf-8 -*-
+"""
+DBNet training (SynthText pretrain -> Manga109 finetune)
+ - Auto-save checkpoints every epoch to Google Drive
+ - Auto-resume from last epoch if interrupted
+ - Auto-clean old checkpoints (keep only latest 2)
+"""
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import os, math, random, csv, glob, re
+from dataclasses import dataclass
+import cv2, numpy as np, torch
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from dbnet_text_detector import DBNet, DBLoss
 
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+# ------------------------
+# Utilities
+# ------------------------
 
-def seed_all(seed=42):
+def seed_all(seed=1337):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-seed_all(1234)
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True); return p
 
-class ConvBNReLU(nn.Module):
-    def __init__(self, in_c, out_c, k=3, s=1, p=1):
-        super().__init__()
-        self.conv = nn.Conv2d(in_c, out_c, k, s, p, bias=False)
-        self.bn = nn.BatchNorm2d(out_c)
-        self.relu = nn.ReLU(inplace=True)
-    def forward(self, x): return self.relu(self.bn(self.conv(x)))
+def write_csv_row(path, header, row):
+    new = not os.path.exists(path)
+    with open(path, 'a', newline='') as f:
+        w = csv.writer(f)
+        if new: w.writerow(header)
+        w.writerow(row)
 
-class SimpleBackbone(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.layer1 = nn.Sequential(ConvBNReLU(3, 32, 3, 2, 1), ConvBNReLU(32, 32, 3, 1, 1))
-        self.layer2 = nn.Sequential(ConvBNReLU(32, 64, 3, 2, 1), ConvBNReLU(64, 64, 3, 1, 1))
-        self.layer3 = nn.Sequential(ConvBNReLU(64, 128, 3, 2, 1), ConvBNReLU(128, 128, 3, 1, 1))
-        self.layer4 = nn.Sequential(ConvBNReLU(128, 256, 3, 2, 1), ConvBNReLU(256, 256, 3, 1, 1))
-    def forward(self, x):
-        c1 = self.layer1(x); c2 = self.layer2(c1); c3 = self.layer3(c2); c4 = self.layer4(c3)
-        return c1, c2, c3, c4
+def polygon_txt_to_mask(txt_path: str, h: int, w: int) -> np.ndarray:
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not os.path.exists(txt_path): 
+        return mask
+    with open(txt_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            nums = list(map(int, line.split(",")))
+            pts = np.array(nums, dtype=np.int32).reshape(-1, 2)
+            cv2.fillPoly(mask, [pts], 1)
+    return mask
 
-class FPNNeck(nn.Module):
-    def __init__(self, in_channels=(32, 64, 128, 256), out_c=128):
-        super().__init__()
-        c1, c2, c3, c4 = in_channels
-        self.lat4 = nn.Conv2d(c4, out_c, 1)
-        self.lat3 = nn.Conv2d(c3, out_c, 1)
-        self.lat2 = nn.Conv2d(c2, out_c, 1)
-        self.lat1 = nn.Conv2d(c1, out_c, 1)
-        self.smooth3 = ConvBNReLU(out_c, out_c, 3, 1, 1)
-        self.smooth2 = ConvBNReLU(out_c, out_c, 3, 1, 1)
-        self.smooth1 = ConvBNReLU(out_c, out_c, 3, 1, 1)
-    def forward(self, c1, c2, c3, c4):
-        p4 = self.lat4(c4)
-        p3 = self.lat3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode='nearest')
-        p2 = self.lat2(c2) + F.interpolate(p3, size=c2.shape[-2:], mode='nearest')
-        p1 = self.lat1(c1) + F.interpolate(p2, size=c1.shape[-2:], mode='nearest')
-        p3 = self.smooth3(p3)
-        p2 = self.smooth2(p2)
-        p1 = self.smooth1(p1)
-        return p1, p2, p3, p4
+def resize_keep_aspect(img, target_long=1024):
+    h, w = img.shape[:2]
+    scale = target_long / max(h, w)
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+    img2 = cv2.resize(img, (nw, nh))
+    return img2, scale
 
+def random_augment(img, mask):
+    h, w = img.shape[:2]
+    s = 0.6 + random.random()*1.0
+    img = cv2.resize(img, (int(w*s), int(h*s)))
+    mask = cv2.resize(mask, (int(w*s), int(h*s)), interpolation=cv2.INTER_NEAREST)
 
-class DBHead(nn.Module):
-    def __init__(self, in_c=128, k=50):
-        super().__init__()
-        self.k = k
-        self.conv = nn.Sequential(
-            ConvBNReLU(in_c*4, in_c, 3, 1, 1),
-            ConvBNReLU(in_c, in_c//2, 3, 1, 1)
-        )
-        self.p_out = nn.Conv2d(in_c//2, 1, 1)
-        self.t_out = nn.Conv2d(in_c//2, 1, 1)
-    def forward(self, p1, p2, p3, p4):
-        p2u = F.interpolate(p2, size=p1.shape[-2:], mode='bilinear', align_corners=False)
-        p3u = F.interpolate(p3, size=p1.shape[-2:], mode='bilinear', align_corners=False)
-        p4u = F.interpolate(p4, size=p1.shape[-2:], mode='bilinear', align_corners=False)
-        x = torch.cat([p1, p2u, p3u, p4u], dim=1)
-        x = self.conv(x)
-        # 🔥 return raw logits, not passed through sigmoid
-        P = self.p_out(x)
-        T = self.t_out(x)
-        B = self.k * (P - T)
-        return P, T, B
+    angle = random.uniform(-7, 7)
+    M = cv2.getRotationMatrix2D((img.shape[1]/2, img.shape[0]/2), angle, 1.0)
+    img = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+    mask = cv2.warpAffine(mask, M, (mask.shape[1], mask.shape[0]), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-class DBNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = SimpleBackbone()
-        self.neck = FPNNeck()
-        self.head = DBHead()
-    def forward(self, x):
-        c1,c2,c3,c4 = self.backbone(x)
-        p1,p2,p3,p4 = self.neck(c1,c2,c3,c4)
-        return self.head(p1,p2,p3,p4)
+    if random.random() < 0.5:
+        img = cv2.flip(img, 1); mask = cv2.flip(mask, 1)
 
-def make_blurred_mask_target(mask: torch.Tensor, blur=3) -> torch.Tensor:
-    target_list = []
-    m = mask.detach().cpu().numpy()
-    for i in range(m.shape[0]):
-        arr = (m[i,0]*255).astype(np.uint8)
-        img = Image.fromarray(arr, mode="L").filter(ImageFilter.GaussianBlur(radius=blur))
-        arr2 = np.array(img).astype(np.float32)/255.0
-        target_list.append(arr2[None, ...])
-    t = torch.from_numpy(np.stack(target_list, axis=0))
-    return t.to(mask.device)
+    if random.random() < 0.8:
+        alpha = 0.85 + random.random()*0.3
+        beta  = random.uniform(-12, 12)
+        img = np.clip(img.astype(np.float32)*alpha + beta, 0, 255).astype(np.uint8)
 
-class DBLoss(nn.Module):
-    def __init__(self, bce_weight=1.0, l1_weight=1.0):
-        super().__init__()
-        # ✅ use BCEWithLogitsLoss (safe for autocast)
-        self.bce = nn.BCEWithLogitsLoss()
-        self.l1 = nn.L1Loss()
-        self.bce_weight = bce_weight
-        self.l1_weight = l1_weight
-    def forward(self, P, T, B, gt_mask):
-        T_target = make_blurred_mask_target(gt_mask, blur=3)
-        loss_p = self.bce(P, gt_mask)
-        loss_t = self.l1(torch.sigmoid(T), T_target)  # still compare after sigmoid
-        loss_b = self.bce(B, gt_mask)
-        loss = self.bce_weight*loss_p + self.l1_weight*loss_t + 0.5*loss_b
-        return loss, {
-            "loss_p": loss_p.item(),
-            "loss_t": loss_t.item(),
-            "loss_b": loss_b.item()
-        }
+    return img, mask
 
+def pad_to_square(img, mask, size=960):
+    h, w = img.shape[:2]
+    s = max(h, w)
+    bg = np.zeros((s, s, 3), dtype=np.uint8)
+    m2 = np.zeros((s, s), dtype=np.uint8)
+    y0 = (s - h) // 2; x0 = (s - w) // 2
+    bg[y0:y0+h, x0:x0+w] = img
+    m2[y0:y0+h, x0:x0+w] = mask
+    img = cv2.resize(bg, (size, size), interpolation=cv2.INTER_LINEAR)
+    mask = cv2.resize(m2, (size, size), interpolation=cv2.INTER_NEAREST)
+    return img, mask
 
-def connected_components(binary: np.ndarray) -> List[np.ndarray]:
-    H, W = binary.shape
-    visited = np.zeros_like(binary, dtype=bool); comps = []
-    for y in range(H):
-        for x in range(W):
-            if binary[y, x] and not visited[y, x]:
-                q = [(y,x)]; visited[y,x]=True; coords=[]
-                while q:
-                    cy,cx = q.pop()
-                    coords.append((cy,cx))
-                    for ny,nx in [(cy-1,cx),(cy+1,cx),(cy,cx-1),(cy,cx+1)]:
-                        if 0<=ny<H and 0<=nx<W and binary[ny,nx] and not visited[ny,nx]:
-                            visited[ny,nx]=True; q.append((ny,nx))
-                mask = np.zeros_like(binary, dtype=bool)
-                ys,xs = zip(*coords); mask[np.array(ys), np.array(xs)] = True
-                comps.append(mask)
-    return comps
+def tensorize(img, mask):
+    img = img.transpose(2,0,1).astype(np.float32) / 255.0
+    mask = mask[None].astype(np.float32)
+    return torch.from_numpy(img), torch.from_numpy(mask)
 
-def mask_to_quad(mask: np.ndarray) -> List[Tuple[float,float]]:
-    ys, xs = np.where(mask)
-    if len(xs)==0: return []
-    x0,x1 = xs.min(), xs.max(); y0,y1 = ys.min(), ys.max()
-    return [(x0,y0),(x1,y0),(x1,y1),(x0,y1)]
+# ------------------------
+# Dataset
+# ------------------------
 
-def unclip_quad(quad, ratio, H, W):
-    if not quad: return quad
-    cx = sum([p[0] for p in quad])/4.0; cy = sum([p[1] for p in quad])/4.0
-    new = []
-    for (x,y) in quad:
-        nx = cx + (x-cx)*ratio; ny = cy + (y-cy)*ratio
-        nx = max(0, min(W-1, nx)); ny = max(0, min(H-1, ny)); new.append((nx,ny))
-    return new
+class DBNetFlatDir(Dataset):
+    def __init__(self, root, img_size=960, augment=False, limit=None, val_split=0.0, subset='train'):
+        self.img_dir = os.path.join(root, "images")
+        self.ann_dir = os.path.join(root, "annotations")
+        names = sorted([os.path.splitext(f)[0] for f in os.listdir(self.img_dir)
+                        if f.lower().endswith((".jpg",".jpeg",".png"))])
+        if limit: names = names[:limit]
+        if val_split > 0:
+            n = len(names)
+            n_val = int(round(n*val_split))
+            random.shuffle(names)
+            if subset == 'train': names = names[n_val:]
+            else: names = names[:n_val]
+        self.stems = names
+        self.img_size = img_size
+        self.augment = augment
 
-def score_instance(prob_map: np.ndarray, mask: np.ndarray) -> float:
-    if mask.sum()==0: return 0.0
-    return float(prob_map[mask].mean())
+    def __len__(self): return len(self.stems)
 
-class DBDetector:
-    def __init__(self, model: nn.Module, device: torch.device = device):
-        self.model = model.to(device); self.model.eval(); self.device = device
-    @torch.no_grad()
-    def detect(self, image_pil: Image.Image, max_side: int = 768, bin_thresh: float = 0.4, unclip: float = 1.5):
-        img = image_pil.convert("RGB"); W,H = img.size
-        scale = min(max_side / max(W,H), 1.0)
-        if scale < 1.0:
-            newW,newH = int(W*scale), int(H*scale); img = img.resize((newW,newH), Image.BILINEAR)
+    def __getitem__(self, idx):
+        stem = self.stems[idx]
+        img_path = None
+        for ext in (".jpg",".jpeg",".png"):
+            p = os.path.join(self.img_dir, stem+ext)
+            if os.path.exists(p): img_path = p; break
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
+        mask = polygon_txt_to_mask(os.path.join(self.ann_dir, stem+".txt"), h, w)
+        if self.augment:
+            img, mask = random_augment(img, mask)
+        img, _ = resize_keep_aspect(img, target_long=1280)
+        mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+        img, mask = pad_to_square(img, mask, size=self.img_size)
+        img, mask = tensorize(img, mask)
+        return {"image": img, "mask": mask}
+
+# ------------------------
+# Training
+# ------------------------
+
+@dataclass
+class PhaseCfg:
+    name: str
+    root: str
+    epochs: int
+    batch_size: int
+    lr: float
+    img_size: int
+    val_split: float = 0.02
+    limit: int = None
+    patience: int = 5
+    save_path: str = ""
+
+def f1_from_logits(P: torch.Tensor, mask: torch.Tensor, thresh=0.3) -> float:
+    with torch.no_grad():
+        prob = torch.sigmoid(P)
+        binm = (prob > thresh).float()
+        tp = (binm * mask).sum().item()
+        fp = (binm * (1-mask)).sum().item()
+        fn = ((1-binm) * mask).sum().item()
+        prec = tp / (tp+fp+1e-8)
+        rec  = tp / (tp+fn+1e-8)
+        return 2*prec*rec/(prec+rec+1e-8)
+
+class Trainer:
+    def __init__(self, device):
+        self.device = device
+        if torch.cuda.is_available():
+            self.autocast_ctx = torch.autocast(device_type='cuda', dtype=torch.float16)
         else:
-            newW,newH = W,H
-        x = torch.from_numpy(np.array(img).transpose(2,0,1)).float()[None,...]/255.0
-        x = x.to(self.device)
-        P,T,B = self.model(x)
-        p_map = F.interpolate(P, size=(newH,newW), mode='bilinear', align_corners=False)[0,0].detach().cpu().numpy()
-        b_map = F.interpolate(B, size=(newH,newW), mode='bilinear', align_corners=False)[0,0].detach().cpu().numpy()
-        binary = (b_map > bin_thresh).astype(np.uint8)
-        comps = connected_components(binary)
-        results = []
-        for comp in comps:
-            if comp.sum() < (0.0005 * newW * newH): continue
-            quad = mask_to_quad(comp); quad = unclip_quad(quad, unclip, newH, newW)
-            score = score_instance(p_map, comp.astype(bool))
-            if scale < 1.0: quad = [(x/scale, y/scale) for (x,y) in quad]
-            results.append({"polygon": quad, "score": score})
-        results.sort(key=lambda r: r["score"], reverse=True)
-        return results
+            self.autocast_ctx = torch.autocast(device_type='cpu', dtype=torch.bfloat16)
+        self.scaler = torch.amp.GradScaler("cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available())
 
-def draw_polygons(img: Image.Image, results: List[Dict[str,Any]]):
-    draw = ImageDraw.Draw(img)
-    for r in results:
-        poly = r["polygon"]
-        if len(poly)==4:
-            draw.polygon(poly, outline=(255,0,0))
-    return img
+    def run_phase(self, model: nn.Module, cfg: PhaseCfg, log_csv: str):
+        ckpt_dir = "/content/drive/MyDrive/manga_datasets/checkpoints"
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-def demo_and_save(model_path=None, out_prefix="/mnt/data/dbnet_demo"):
+        # detect latest completed epoch
+        existing = sorted(glob.glob(os.path.join(ckpt_dir, f"{cfg.name}_epoch*.pth")))
+        start_epoch = 1
+        if existing:
+            latest = existing[-1]
+            m = re.search(r"epoch(\d+)", latest)
+            if m: start_epoch = int(m.group(1))+1
+            print(f"🔁 Resuming from checkpoint {latest} (will start at epoch {start_epoch})")
+            model.load_state_dict(torch.load(latest, map_location=self.device))
+
+        ds_train = DBNetFlatDir(cfg.root, img_size=cfg.img_size, augment=True, limit=cfg.limit, val_split=cfg.val_split, subset='train')
+        ds_val   = DBNetFlatDir(cfg.root, img_size=cfg.img_size, augment=False, limit=cfg.limit, val_split=cfg.val_split, subset='val')
+        dl_tr = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True, num_workers=0, drop_last=True)
+        dl_va = DataLoader(ds_val,   batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+
+        print(f"Phase [{cfg.name}] — train {len(ds_train)} / val {len(ds_val)} images")
+
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4, betas=(0.9, 0.999))
+        total_steps = max(1, cfg.epochs * len(dl_tr))
+        warmup_steps = min(1500, int(0.03 * total_steps))
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return max(1e-3, step / max(1, warmup_steps))
+            t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * t))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+        criterion = DBLoss()
+        best_f1 = -1.0
+        bad = 0
+
+        for ep in range(start_epoch, cfg.epochs+1):
+            model.train()
+            pbar = tqdm(dl_tr, desc=f"{cfg.name} | epoch {ep}/{cfg.epochs}")
+            tr_loss = 0.0; step = 0
+
+            for batch in pbar:
+                imgs = batch["image"].to(self.device)
+                masks = batch["mask"].to(self.device)
+
+                with self.autocast_ctx:
+                    P, T, B = model(imgs)
+                    if masks.shape[-2:] != P.shape[-2:]:
+                        masks = torch.nn.functional.interpolate(masks, size=P.shape[-2:], mode="nearest")
+                    loss, _ = criterion(P, T, B, masks)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step(); sched.step()
+
+                tr_loss += loss.item(); step += 1
+                if step % 10 == 0:
+                    pbar.set_postfix(loss=f"{tr_loss/step:.4f}", lr=f"{sched.get_last_lr()[0]:.2e}")
+
+            # --- validate ---
+            model.eval()
+            va_loss = 0.0; va_f1 = 0.0; n = 0
+            with torch.no_grad():
+                for batch in dl_va:
+                    imgs = batch["image"].to(self.device)
+                    masks = batch["mask"].to(self.device)
+                    P, T, B = model(imgs)
+                    if masks.shape[-2:] != P.shape[-2:]:
+                        masks = torch.nn.functional.interpolate(masks, size=P.shape[-2:], mode="nearest")
+                    loss, _ = criterion(P, T, B, masks)
+                    va_loss += loss.item()
+                    va_f1   += f1_from_logits(P, masks)
+                    n += 1
+            va_loss /= max(1,n); va_f1 /= max(1,n)
+            print(f"  val: loss={va_loss:.4f}  pixel-F1={va_f1:.4f}")
+
+            write_csv_row(log_csv, ["phase","epoch","train_loss","val_loss","val_f1","lr"],
+                          [cfg.name, ep, f"{tr_loss/max(1,step):.6f}", f"{va_loss:.6f}", f"{va_f1:.6f}", f"{sched.get_last_lr()[0]:.3e}"])
+
+            # save checkpoints
+            epoch_ckpt = os.path.join(ckpt_dir, f"{cfg.name}_epoch{ep}.pth")
+            torch.save(model.state_dict(), epoch_ckpt)
+            print(f"  💾 Saved checkpoint: {epoch_ckpt}")
+
+            # cleanup old checkpoints (keep only last 2)
+            ckpts = sorted(glob.glob(os.path.join(ckpt_dir, f"{cfg.name}_epoch*.pth")))
+            if len(ckpts) > 2:
+                for old_ckpt in ckpts[:-2]:
+                    os.remove(old_ckpt)
+                    print(f"  🗑️ Deleted old checkpoint: {old_ckpt}")
+
+            if va_f1 > best_f1:
+                best_f1 = va_f1
+                torch.save(model.state_dict(), cfg.save_path)
+                print(f"  ✅ new best {best_f1:.4f} -> saved {cfg.save_path}")
+                bad = 0
+            else:
+                bad += 1
+                if bad >= cfg.patience:
+                    print("  ⏹ early stop (no F1 improvement)")
+                    break
+
+        return cfg.save_path, best_f1
+
+# ------------------------
+# Main
+# ------------------------
+
+def main():
+    seed_all(1337)
+    ensure_dir("outputs"); ensure_dir("outputs/logs")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
     model = DBNet().to(device)
-    if model_path and os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-    det = DBDetector(model, device=device)
-    W,H = 768, 512
-    img = Image.new("RGB",(W,H),(255,255,255)); d = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("Arial.ttf", 42)
-    except Exception:
-        font = ImageFont.load_default()
-    d.text((40,60),"HELLO WORLD",(0,0,0),font=font)
-    d.text((50,140),"This is a DBNet demo",(0,0,0),font=font)
-    d.text((60,220),"M1 Max Prototype",(0,0,0),font=font)
-    results = det.detect(img, max_side=768, bin_thresh=0.4, unclip=1.6)
-    vis = draw_polygons(img.copy(), results)
-    img_path = out_prefix + "_result.png"
-    json_path = out_prefix + "_result.json"
-    vis.save(img_path)
-    with open(json_path,"w") as f:
-        json.dump({"detections": results}, f, indent=2)
-    print("Saved:", img_path, json_path)
+
+    trainer = Trainer(device)
+    log_csv = "outputs/logs/train_log.csv"
+
+    synth_cfg = PhaseCfg(
+        name="pretrain_synthtext",
+        root="datasets/synthtext_dbnet",
+        epochs=15,
+        batch_size=6,
+        lr=1e-3,
+        img_size=960,
+        val_split=0.01,
+        limit=5000,
+        save_path="outputs/dbnet_pretrained.pth"
+    )
+    best_pre_ckpt, best_pre_f1 = trainer.run_phase(model, synth_cfg, log_csv)
+    print(f"Pretraining done. Best pixel-F1={best_pre_f1:.4f}")
+
+    sd = torch.load(best_pre_ckpt, map_location=device)
+    model.load_state_dict(sd, strict=True)
+
+    manga_cfg = PhaseCfg(
+        name="finetune_manga109",
+        root="datasets/manga109_dbnet",
+        epochs=20,
+        batch_size=4,
+        lr=5e-4,
+        img_size=1024,
+        val_split=0.02,
+        save_path="outputs/dbnet_trained.pth"
+    )
+    best_ft_ckpt, best_ft_f1 = trainer.run_phase(model, manga_cfg, log_csv)
+    print(f"Finetune done. Best pixel-F1={best_ft_f1:.4f}")
+    print("✅ Final weights:", best_ft_ckpt)
 
 if __name__ == "__main__":
-    demo_and_save()
+    main()
