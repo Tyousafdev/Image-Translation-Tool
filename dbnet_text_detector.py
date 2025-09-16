@@ -61,7 +61,10 @@ class DBHead(nn.Module):
     def __init__(self, in_c=128, k=50):
         super().__init__()
         self.k = k
-        self.conv = nn.Sequential(ConvBNReLU(in_c*4, in_c, 3, 1, 1), ConvBNReLU(in_c, in_c//2, 3, 1, 1))
+        self.conv = nn.Sequential(
+            ConvBNReLU(in_c*4, in_c, 3, 1, 1),
+            ConvBNReLU(in_c, in_c//2, 3, 1, 1)
+        )
         self.p_out = nn.Conv2d(in_c//2, 1, 1)
         self.t_out = nn.Conv2d(in_c//2, 1, 1)
     def forward(self, p1, p2, p3, p4):
@@ -70,9 +73,10 @@ class DBHead(nn.Module):
         p4u = F.interpolate(p4, size=p1.shape[-2:], mode='bilinear', align_corners=False)
         x = torch.cat([p1, p2u, p3u, p4u], dim=1)
         x = self.conv(x)
-        P = torch.sigmoid(self.p_out(x))
-        T = torch.sigmoid(self.t_out(x))
-        B = torch.sigmoid(self.k * (P - T))
+        # 🔥 return raw logits, not passed through sigmoid
+        P = self.p_out(x)
+        T = self.t_out(x)
+        B = self.k * (P - T)
         return P, T, B
 
 class DBNet(nn.Module):
@@ -100,15 +104,23 @@ def make_blurred_mask_target(mask: torch.Tensor, blur=3) -> torch.Tensor:
 class DBLoss(nn.Module):
     def __init__(self, bce_weight=1.0, l1_weight=1.0):
         super().__init__()
-        self.bce = nn.BCELoss(); self.l1 = nn.L1Loss()
-        self.bce_weight = bce_weight; self.l1_weight = l1_weight
+        # ✅ use BCEWithLogitsLoss (safe for autocast)
+        self.bce = nn.BCEWithLogitsLoss()
+        self.l1 = nn.L1Loss()
+        self.bce_weight = bce_weight
+        self.l1_weight = l1_weight
     def forward(self, P, T, B, gt_mask):
         T_target = make_blurred_mask_target(gt_mask, blur=3)
         loss_p = self.bce(P, gt_mask)
-        loss_t = self.l1(T, T_target)
+        loss_t = self.l1(torch.sigmoid(T), T_target)  # still compare after sigmoid
         loss_b = self.bce(B, gt_mask)
         loss = self.bce_weight*loss_p + self.l1_weight*loss_t + 0.5*loss_b
-        return loss, {"loss_p": loss_p.item(), "loss_t": loss_t.item(), "loss_b": loss_b.item()}
+        return loss, {
+            "loss_p": loss_p.item(),
+            "loss_t": loss_t.item(),
+            "loss_b": loss_b.item()
+        }
+
 
 def connected_components(binary: np.ndarray) -> List[np.ndarray]:
     H, W = binary.shape
