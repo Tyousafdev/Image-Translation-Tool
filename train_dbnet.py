@@ -154,7 +154,7 @@ def main():
     trainer = Trainer(device)
 
     # 👇 Medium run (~20–30 min)
-    USE_MEDIUM = True
+    USE_MEDIUM = False
 
     if USE_MEDIUM:
         synth_cfg = PhaseCfg(
@@ -175,13 +175,13 @@ def main():
         synth_cfg = PhaseCfg(
             name="pretrain_synthtext",
             root="datasets/synthtext_dbnet",
-            epochs=15, batch_size=6, lr=1e-3, img_size=960,
+            epochs=25, batch_size=6, lr=1e-3, img_size=960,
             val_split=0.01, save_path="outputs/dbnet_pretrained.pth"
         )
         manga_cfg = PhaseCfg(
             name="finetune_manga109",
             root="datasets/manga109_dbnet",
-            epochs=20, batch_size=4, lr=5e-4, img_size=1024,
+            epochs=30, batch_size=4, lr=5e-4, img_size=1024,
             val_split=0.02, save_path="outputs/dbnet_trained.pth"
         )
 

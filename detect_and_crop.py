@@ -10,7 +10,7 @@ from dbnet_text_detector import DBNet, DBDetector
 # --- Config ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # CHANGED PATH TO SMOKE FROM dbnet_trained.pth
-MODEL_PATH = "outputs/dbnet_smoke.pth"
+MODEL_PATH = "outputs/dbnet_trained_med.pth"
 INPUT_DIR = "test_pages"
 OUTPUT_DIR = "detection_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
