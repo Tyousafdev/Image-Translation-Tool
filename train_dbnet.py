@@ -1,231 +1,186 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-DBNet smoke test training (Step 1: text detection)
-Trains on polygon annotations in datasets/<name>/{images,annotations}
-
-- Expects .jpg images and matching .txt annotation files:
-  x1,y1,x2,y2,... per line (polygon vertices)
-- Outputs:
-    outputs/dbnet_smoke.pth
-    outputs/logs/train_log.csv
-"""
-
-import os, math, random, csv
-from dataclasses import dataclass
-from typing import List
-import numpy as np
-import cv2
-from PIL import Image, ImageDraw
+import os, random, json
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import functional as TF
-from tqdm import tqdm
+from torchvision import transforms
+from PIL import Image, ImageDraw
+from pathlib import Path
 
-from dbnet_text_detector import DBNet, DBLoss   # <- your model/loss file
+from dbnet_text_detector import DBNet  # your DBNet model
 
-# ------------------------
-# Utils
-# ------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def seed_all(seed=1337):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-def ensure_dir(p):
-    os.makedirs(p, exist_ok=True); return p
-
-def write_csv_row(path, header, row):
-    new = not os.path.exists(path)
-    with open(path, 'a', newline='') as f:
-        w = csv.writer(f)
-        if new: w.writerow(header)
-        w.writerow(row)
-
-def read_polys_txt(path: str) -> List[np.ndarray]:
-    polys = []
-    if not os.path.exists(path): return polys
-    with open(path, "r") as f:
-        for line in f:
-            parts = [p.strip() for p in line.strip().split(",") if p.strip() != ""]
-            if len(parts) < 6: continue
-            try:
-                nums = list(map(float, parts))
-                pts = np.array(nums, dtype=np.int32).reshape(-1,2)
-                if len(pts) >= 3:
-                    polys.append(pts)
-            except: continue
-    return polys
-
-def polygons_to_mask(polys: List[np.ndarray], h: int, w: int) -> np.ndarray:
-    mask = np.zeros((h,w), dtype=np.uint8)
-    for p in polys:
-        cv2.fillPoly(mask, [p], 1)
-    return mask
-
-def resize_keep_aspect(img, mask, target_long=960):
-    h,w = img.shape[:2]
-    scale = target_long / max(h,w)
-    nh,nw = int(h*scale), int(w*scale)
-    img2 = cv2.resize(img, (nw,nh))
-    mask2 = cv2.resize(mask, (nw,nh), interpolation=cv2.INTER_NEAREST)
-    return img2, mask2
-
-def pad_to_square(img, mask, size=960):
-    h,w = img.shape[:2]
-    s = max(h,w)
-    bg = np.zeros((s,s,3), dtype=np.uint8)
-    m2 = np.zeros((s,s), dtype=np.uint8)
-    y0 = (s-h)//2; x0 = (s-w)//2
-    bg[y0:y0+h,x0:x0+w] = img
-    m2[y0:y0+h,x0:x0+w] = mask
-    img = cv2.resize(bg, (size,size))
-    mask = cv2.resize(m2, (size,size), interpolation=cv2.INTER_NEAREST)
-    return img, mask
-
-# ------------------------
-# Dataset
-# ------------------------
-
-class PolyDataset(Dataset):
-    def __init__(self, root, img_size=960, limit=None, val_split=0.1, subset="train"):
-        self.img_dir = os.path.join(root,"images")
-        self.ann_dir = os.path.join(root,"annotations")
-        names = sorted([os.path.splitext(f)[0] for f in os.listdir(self.img_dir) if f.endswith(".jpg")])
-        if limit: names = names[:limit]
-        if val_split>0:
-            random.shuffle(names)
-            n_val = int(len(names)*val_split)
-            if subset=="train": names = names[n_val:]
-            else: names = names[:n_val]
-        self.stems = names
+# ============================
+# Dataset Loader
+# ============================
+class TextDataset(Dataset):
+    def __init__(self, root, img_size=1024, limit=None, transform=None):
+        self.root = Path(root)
+        self.img_dir = self.root / "images"
+        self.ann_dir = self.root / "annotations"
+        self.transform = transform
         self.img_size = img_size
 
-    def __len__(self): return len(self.stems)
+        self.samples = sorted(self.img_dir.glob("*.jpg"))
+        if limit: self.samples = self.samples[:limit]
+
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        stem = self.stems[idx]
-        img = cv2.imread(os.path.join(self.img_dir, stem+".jpg"))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h,w = img.shape[:2]
-        polys = read_polys_txt(os.path.join(self.ann_dir, stem+".txt"))
-        mask = polygons_to_mask(polys, h, w)
-        img, mask = resize_keep_aspect(img, mask, target_long=1280)
-        img, mask = pad_to_square(img, mask, size=self.img_size)
-        img = img.transpose(2,0,1).astype(np.float32)/255.0
-        mask = mask[None].astype(np.float32)
-        return torch.from_numpy(img), torch.from_numpy(mask)
+        img_path = self.samples[idx]
+        ann_path = self.ann_dir / (img_path.stem + ".txt")
 
-# ------------------------
-# Training
-# ------------------------
+        img = Image.open(img_path).convert("RGB")
+        w, h = img.size
 
-@dataclass
+        # Create binary mask from polygons
+        mask = Image.new("L", (w, h), 0)
+        if ann_path.exists():
+            with open(ann_path) as f:
+                for line in f:
+                    pts = [tuple(map(float, p.split(','))) for p in line.strip().split()]
+                    ImageDraw.Draw(mask).polygon(pts, outline=1, fill=1)
+
+        if self.transform:
+            seed = random.randint(0, 2**32)
+            random.seed(seed); torch.manual_seed(seed)
+            img = self.transform(img)
+            random.seed(seed); torch.manual_seed(seed)
+            mask = self.transform(mask)
+
+        return img, mask
+
+
+# ============================
+# Config Struct
+# ============================
 class PhaseCfg:
-    name: str
-    root: str
-    epochs: int
-    batch_size: int
-    lr: float
-    img_size: int
-    val_split: float = 0.1
-    limit: int = None
-    patience: int = 3
-    save_path: str = ""
+    def __init__(self, name, root, epochs, batch_size, lr, img_size, val_split, save_path, limit=None):
+        self.name = name
+        self.root = root
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.img_size = img_size
+        self.val_split = val_split
+        self.save_path = save_path
+        self.limit = limit
 
-def f1_from_logits(logits: torch.Tensor, mask: torch.Tensor, thresh=0.3):
-    with torch.no_grad():
-        prob = torch.sigmoid(logits)
-        binm = (prob>thresh).float()
-        tp = (binm*mask).sum().item()
-        fp = (binm*(1-mask)).sum().item()
-        fn = ((1-binm)*mask).sum().item()
-        prec = tp/(tp+fp+1e-8)
-        rec = tp/(tp+fn+1e-8)
-        return 2*prec*rec/(prec+rec+1e-8)
 
+# ============================
+# Trainer
+# ============================
 class Trainer:
-    def __init__(self, device): self.device = device
+    def __init__(self, device):
+        self.device = device
 
-    def run_phase(self, model, cfg, log_csv):
-        ds_tr = PolyDataset(cfg.root, cfg.img_size, cfg.limit, cfg.val_split, "train")
-        ds_va = PolyDataset(cfg.root, cfg.img_size, cfg.limit, cfg.val_split, "val")
-        dl_tr = DataLoader(ds_tr, batch_size=cfg.batch_size, shuffle=True)
-        dl_va = DataLoader(ds_va, batch_size=cfg.batch_size)
+    def run_phase(self, model, cfg: PhaseCfg, log_csv="outputs/logs/train_log.csv"):
+        tfm = transforms.Compose([
+            transforms.Resize((cfg.img_size, cfg.img_size)),
+            transforms.ToTensor()
+        ])
+        dataset = TextDataset(cfg.root, cfg.img_size, limit=cfg.limit, transform=tfm)
+        val_len = max(1, int(len(dataset) * cfg.val_split))
+        train_len = len(dataset) - val_len
+        train_ds, val_ds = torch.utils.data.random_split(dataset, [train_len, val_len])
 
-        print(f"Phase {cfg.name}: train={len(ds_tr)} val={len(ds_va)}")
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs*len(dl_tr))
-        criterion = DBLoss()
-        best_f1, bad = 0.0, 0
+        dl_tr = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=2)
+        dl_val = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=2)
 
-        for ep in range(1,cfg.epochs+1):
+        model = model.to(self.device)
+        opt = optim.AdamW(model.parameters(), lr=cfg.lr)
+        bce = nn.BCEWithLogitsLoss()
+
+        best_f1 = 0.0
+        os.makedirs(Path(cfg.save_path).parent, exist_ok=True)
+
+        for epoch in range(cfg.epochs):
             model.train()
-            pbar = tqdm(dl_tr, desc=f"{cfg.name} epoch {ep}/{cfg.epochs}")
-            tr_loss, step = 0,0
-            for imgs,masks in pbar:
+            for imgs, masks in dl_tr:
                 imgs, masks = imgs.to(self.device), masks.to(self.device)
-                P,T,B = model(imgs)
-                if masks.shape[-2:] != P.shape[-2:]:
-                    masks = torch.nn.functional.interpolate(masks, size=P.shape[-2:], mode="nearest")
-                loss,_ = criterion(P,T,B,masks)
-                opt.zero_grad(); loss.backward(); opt.step(); sched.step()
-                tr_loss += loss.item(); step+=1
-                if step%10==0:
-                    fg = masks.sum().item()/(masks.numel()+1e-8)*100
-                    pbar.set_postfix(loss=tr_loss/step, fg=f"{fg:.2f}%")
+                preds = model(imgs)
+                loss = bce(preds.squeeze(1), masks.squeeze(1))
+                opt.zero_grad(); loss.backward(); opt.step()
 
+            # ---------- validation ----------
             model.eval()
-            va_loss, va_f1, n = 0,0,0
+            tp = fp = fn = 0
+            val_loss = 0
             with torch.no_grad():
-                for imgs,masks in dl_va:
-                    imgs,masks = imgs.to(self.device), masks.to(self.device)
-                    P,T,B = model(imgs)
-                    if masks.shape[-2:] != P.shape[-2:]:
-                        masks = torch.nn.functional.interpolate(masks, size=P.shape[-2:], mode="nearest")
-                    loss,_ = criterion(P,T,B,masks)
-                    va_loss += loss.item()
-                    va_f1 += f1_from_logits(P,masks); n+=1
-            va_loss/=max(1,n); va_f1/=max(1,n)
-            print(f" val loss={va_loss:.4f} f1={va_f1:.4f}")
+                for imgs, masks in dl_val:
+                    imgs, masks = imgs.to(self.device), masks.to(self.device)
+                    preds = torch.sigmoid(model(imgs))
+                    val_loss += bce(preds.squeeze(1), masks.squeeze(1)).item()
+                    bin_preds = (preds > 0.3).float()
+                    tp += (bin_preds * masks).sum().item()
+                    fp += (bin_preds * (1 - masks)).sum().item()
+                    fn += ((1 - bin_preds) * masks).sum().item()
+            precision = tp / (tp + fp + 1e-6)
+            recall = tp / (tp + fn + 1e-6)
+            f1 = 2 * precision * recall / (precision + recall + 1e-6)
 
-            write_csv_row(log_csv,["phase","epoch","val_f1"],[cfg.name,ep,f"{va_f1:.4f}"])
-            if va_f1>best_f1:
-                best_f1=va_f1; torch.save(model.state_dict(), cfg.save_path)
-                print("  ✅ saved",cfg.save_path)
-                bad=0
-            else:
-                bad+=1
-                if bad>=cfg.patience:
-                    print("⏹ early stop"); break
-        return cfg.save_path,best_f1
+            print(f"[{cfg.name}] epoch {epoch+1}/{cfg.epochs} "
+                  f"val_loss={val_loss/len(dl_val):.4f} f1={f1:.4f}")
 
-# ------------------------
+            if f1 > best_f1:
+                best_f1 = f1
+                torch.save(model.state_dict(), cfg.save_path)
+                print(f"✅ new best {best_f1:.4f} -> saved {cfg.save_path}")
+
+        return cfg.save_path, best_f1
+
+
+# ============================
 # Main
-# ------------------------
+# ============================
+if __name__ == "__main__":
+    os.makedirs("outputs/logs", exist_ok=True)
 
-def main():
-    seed_all(1337)
-    ensure_dir("outputs"); ensure_dir("outputs/logs")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
-    model = DBNet().to(device)
+    model = DBNet()
+
     trainer = Trainer(device)
 
-    # ---- SMOKE TEST CONFIG ----
-    cfg = PhaseCfg(
-        name="smoke_manga",
-        root="datasets/manga109_dbnet",
-        epochs=1,
-        batch_size=4,
-        lr=1e-3,
-        img_size=768,
-        val_split=0.1,
-        limit=240,
-        save_path="outputs/dbnet_smoke.pth"
-    )
-    trainer.run_phase(model, cfg, "outputs/logs/train_log.csv")
+    # --------------------------
+    # ⚡ Choose smoke or full
+    # --------------------------
+    USE_SMOKE = True   # ⬅️ flip this to True for quick ~20min run
 
-if __name__ == "__main__":
-    main()
+    if USE_SMOKE:
+        synth_cfg = PhaseCfg(
+            name="pretrain_synthtext_smoke",
+            root="datasets/synthtext_dbnet",
+            epochs=1, batch_size=8, lr=1e-3, img_size=768,
+            val_split=0.01, limit=1000, save_path="outputs/dbnet_pretrained_smoke.pth"
+        )
+        manga_cfg = PhaseCfg(
+            name="finetune_manga109_smoke",
+            root="datasets/manga109_dbnet",
+            epochs=2, batch_size=4, lr=5e-4, img_size=896,
+            val_split=0.02, limit=200, save_path="outputs/dbnet_trained_smoke.pth"
+        )
+    else:
+        synth_cfg = PhaseCfg(
+            name="pretrain_synthtext",
+            root="datasets/synthtext_dbnet",
+            epochs=15, batch_size=6, lr=1e-3, img_size=960,
+            val_split=0.01, save_path="outputs/dbnet_pretrained.pth"
+        )
+        manga_cfg = PhaseCfg(
+            name="finetune_manga109",
+            root="datasets/manga109_dbnet",
+            epochs=20, batch_size=4, lr=5e-4, img_size=1024,
+            val_split=0.02, save_path="outputs/dbnet_trained.pth"
+        )
+
+    # --------------------------
+    # 🔁 Run training
+    # --------------------------
+    best_pre_ckpt, best_pre_f1 = trainer.run_phase(model, synth_cfg)
+    model.load_state_dict(torch.load(best_pre_ckpt, map_location=device), strict=True)
+    best_final_ckpt, best_final_f1 = trainer.run_phase(model, manga_cfg)
+
+    print(f"\n✅ Training complete. Best F1: {best_final_f1:.4f}")
+    print(f"Model saved at: {best_final_ckpt}")
