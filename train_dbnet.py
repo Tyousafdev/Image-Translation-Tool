@@ -271,12 +271,13 @@ def main():
     seed_all(1337)
     ensure_dir("outputs"); ensure_dir("outputs/logs")
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device("cuda")
+        print("✅ Using GPU:", torch.cuda.get_device_name(0))
     else:
         device = torch.device("cpu")
+    print("⚠️ Using CPU — no GPU detected")
+
     print("Device:", device)
 
     model = DBNet().to(device)
