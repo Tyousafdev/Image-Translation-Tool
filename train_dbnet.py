@@ -284,12 +284,13 @@ def main():
     synth_cfg = PhaseCfg(
         name="pretrain_synthtext",
         root="datasets/synthtext_dbnet",
-        epochs=1,             # ✅ only 1 epoch for speed
-        batch_size=4,          # smaller to save VRAM
+        epochs=30,            # ✅ long pretrain
+        batch_size=6,          # increase if VRAM allows
         lr=1e-3,
-        img_size=768,           # slightly smaller
+        img_size=1024,          # bigger helps precision
         val_split=0.01,
-        limit=1000,             # ✅ only 1k samples for quick run
+        limit=None,              # ✅ all data (20k)
+        patience=6,
         save_path="outputs/dbnet_pretrained.pth"
     )
     trainer = Trainer(device)
@@ -302,15 +303,17 @@ def main():
     manga_cfg = PhaseCfg(
         name="finetune_manga109",
         root="datasets/manga109_dbnet",
-        epochs=1,              # ✅ quick finetune
-        batch_size=2,           # smaller VRAM
-        lr=5e-4,
-        img_size=896,
-        val_split=0.05,
-        limit=200,               # ✅ small subset
+        epochs=30,             # ✅ long finetune
+        batch_size=6,
+        lr=3e-4,                 # slightly lower for fine-tune stability
+        img_size=1280,            # bigger pages = better text coverage
+        val_split=0.02,
+        limit=None,
+        patience=8,
         save_path="outputs/dbnet_trained.pth"
     )
     best_ft_ckpt, best_ft_f1 = trainer.run_phase(model, manga_cfg, log_csv)
+
 
     print(f"Finetune done. Best pixel-F1={best_ft_f1:.4f}")
     print("✅ Final weights:", best_ft_ckpt)
