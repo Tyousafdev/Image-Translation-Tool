@@ -153,19 +153,23 @@ def main():
     model = DBNet().to(device)
     trainer = Trainer(device)
 
-    USE_SMOKE = True
-    if USE_SMOKE:
+    # 👇 Medium run (~20–30 min)
+    USE_MEDIUM = True
+
+    if USE_MEDIUM:
         synth_cfg = PhaseCfg(
-            name="pretrain_synthtext_smoke",
+            name="pretrain_synthtext_med",
             root="datasets/synthtext_dbnet",
-            epochs=1, batch_size=8, lr=1e-3, img_size=640,
-            val_split=0.01, limit=200, save_path="outputs/dbnet_pretrained_smoke.pth"
+            epochs=5, batch_size=6, lr=1e-3, img_size=832,
+            val_split=0.01, limit=3000,  # limit ≈ 3k images
+            save_path="outputs/dbnet_pretrained_med.pth"
         )
         manga_cfg = PhaseCfg(
-            name="finetune_manga109_smoke",
+            name="finetune_manga109_med",
             root="datasets/manga109_dbnet",
-            epochs=1, batch_size=4, lr=5e-4, img_size=640,
-            val_split=0.02, limit=100, save_path="outputs/dbnet_trained_smoke.pth"
+            epochs=6, batch_size=4, lr=5e-4, img_size=960,
+            val_split=0.02, limit=700,  # limit ≈ 500 pages
+            save_path="outputs/dbnet_trained_med.pth"
         )
     else:
         synth_cfg = PhaseCfg(
@@ -180,6 +184,7 @@ def main():
             epochs=20, batch_size=4, lr=5e-4, img_size=1024,
             val_split=0.02, save_path="outputs/dbnet_trained.pth"
         )
+
 
     best_pre,_ = trainer.run_phase(model, synth_cfg)
     model.load_state_dict(torch.load(best_pre, map_location=device))
