@@ -51,11 +51,14 @@ class FPNNeck(nn.Module):
         self.smooth1 = ConvBNReLU(out_c, out_c, 3, 1, 1)
     def forward(self, c1, c2, c3, c4):
         p4 = self.lat4(c4)
-        p3 = self.lat3(c3) + F.interpolate(p4, scale_factor=2, mode='nearest')
-        p2 = self.lat2(c2) + F.interpolate(p3, scale_factor=2, mode='nearest')
-        p1 = self.lat1(c1) + F.interpolate(p2, scale_factor=2, mode='nearest')
-        p3 = self.smooth3(p3); p2 = self.smooth2(p2); p1 = self.smooth1(p1)
+        p3 = self.lat3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode='nearest')
+        p2 = self.lat2(c2) + F.interpolate(p3, size=c2.shape[-2:], mode='nearest')
+        p1 = self.lat1(c1) + F.interpolate(p2, size=c1.shape[-2:], mode='nearest')
+        p3 = self.smooth3(p3)
+        p2 = self.smooth2(p2)
+        p1 = self.smooth1(p1)
         return p1, p2, p3, p4
+
 
 class DBHead(nn.Module):
     def __init__(self, in_c=128, k=50):
