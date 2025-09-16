@@ -41,8 +41,18 @@ class TextDataset(Dataset):
         if ann_path.exists():
             with open(ann_path) as f:
                 for line in f:
-                    pts = [tuple(map(float, p.split(','))) for p in line.strip().split()]
-                    ImageDraw.Draw(mask).polygon(pts, outline=1, fill=1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    coords = line.replace(',', ' ').split()
+                    # make pairs: [x1,y1,x2,y2,...] -> [(x1,y1), (x2,y2)...]
+                    try:
+                        pts = [(float(coords[i]), float(coords[i+1])) for i in range(0, len(coords), 2)]
+                    except ValueError:
+                        continue
+                    if len(pts) >= 3:
+                        ImageDraw.Draw(mask).polygon(pts, outline=1, fill=1)
+
 
         if self.transform:
             seed = random.randint(0, 2**32)
