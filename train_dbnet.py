@@ -271,12 +271,11 @@ def main():
     seed_all(1337)
     ensure_dir("outputs"); ensure_dir("outputs/logs")
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("✅ Using GPU:", torch.cuda.get_device_name(0))
-    else:
-        device = torch.device("cpu")
-    print("⚠️ Using CPU — no GPU detected")
+    if not torch.cuda.is_available():
+        raise RuntimeError("❌ No GPU detected! Please enable GPU in Colab: Runtime > Change runtime type > GPU")
+
+    device = torch.device("cuda")
+    print("✅ Using GPU:", torch.cuda.get_device_name(0))
 
     print("Device:", device)
 
