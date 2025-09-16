@@ -284,18 +284,17 @@ def main():
     synth_cfg = PhaseCfg(
         name="pretrain_synthtext",
         root="datasets/synthtext_dbnet",
-        epochs=15,
-        batch_size=6,
+        epochs=1,             # ✅ only 1 epoch for speed
+        batch_size=4,          # smaller to save VRAM
         lr=1e-3,
-        img_size=960,
+        img_size=768,           # slightly smaller
         val_split=0.01,
-        limit=5000,
+        limit=1000,             # ✅ only 1k samples for quick run
         save_path="outputs/dbnet_pretrained.pth"
     )
     trainer = Trainer(device)
     log_csv = "outputs/logs/train_log.csv"
     best_pre_ckpt, best_pre_f1 = trainer.run_phase(model, synth_cfg, log_csv)
-    print(f"Pretraining done. Best pixel-F1={best_pre_f1:.4f}")
 
     sd = torch.load(best_pre_ckpt, map_location=device)
     model.load_state_dict(sd, strict=True)
@@ -303,14 +302,16 @@ def main():
     manga_cfg = PhaseCfg(
         name="finetune_manga109",
         root="datasets/manga109_dbnet",
-        epochs=20,
-        batch_size=4,
+        epochs=1,              # ✅ quick finetune
+        batch_size=2,           # smaller VRAM
         lr=5e-4,
-        img_size=1024,
-        val_split=0.02,
+        img_size=896,
+        val_split=0.05,
+        limit=200,               # ✅ small subset
         save_path="outputs/dbnet_trained.pth"
     )
     best_ft_ckpt, best_ft_f1 = trainer.run_phase(model, manga_cfg, log_csv)
+
     print(f"Finetune done. Best pixel-F1={best_ft_f1:.4f}")
     print("✅ Final weights:", best_ft_ckpt)
 
