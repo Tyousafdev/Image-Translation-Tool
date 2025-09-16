@@ -284,12 +284,12 @@ def main():
     synth_cfg = PhaseCfg(
         name="pretrain_synthtext",
         root="datasets/synthtext_dbnet",
-        epochs=15,
-        batch_size=6,
+        epochs=1,              # just 1 epoch
+        batch_size=2,           # smaller batch
         lr=1e-3,
-        img_size=960,
-        val_split=0.01,
-        limit=5000,
+        img_size=512,            # smaller images
+        val_split=0.1,            # 10% for val
+        limit=100,               # only 100 images
         save_path="outputs/dbnet_pretrained.pth"
     )
     trainer = Trainer(device)
@@ -303,11 +303,12 @@ def main():
     manga_cfg = PhaseCfg(
         name="finetune_manga109",
         root="datasets/manga109_dbnet",
-        epochs=20,
-        batch_size=4,
+        epochs=1,
+        batch_size=2,
         lr=5e-4,
-        img_size=1024,
-        val_split=0.02,
+        img_size=512,
+        val_split=0.1,
+        limit=100,
         save_path="outputs/dbnet_trained.pth"
     )
     best_ft_ckpt, best_ft_f1 = trainer.run_phase(model, manga_cfg, log_csv)
